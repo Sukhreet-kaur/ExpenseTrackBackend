@@ -650,7 +650,7 @@ router.post('/:id/import-csv/approve', protect, async (req, res) => {
             return res.status(404).json({ message: 'Group not found' });
         }
         
-        // Create member name to ID mapping
+        // Create member name to ID mapping (case-insensitive)
         const memberMap = new Map();
         group.members.forEach(m => {
             if (m.name) {
@@ -662,81 +662,82 @@ router.post('/:id/import-csv/approve', protect, async (req, res) => {
         
         for (const expense of clean_data) {
             try {
-                // Skip if required fields missing
-                if (!expense.description || !expense.amount || !expense.paid_by) {
-                    errors.push(`Skipping: Missing required fields in ${expense.description || 'unknown expense'}`);
+                // Skip if missing required fields
+                if (!expense.description || !expense.amount) {
+                    errors.push(`Skipping: Missing required fields`);
+                    continue;
+                }
+                
+                // Handle paid_by - trim and capitalize
+                const paidByName = expense.paid_by ? expense.paid_by.trim() : '';
+                
+                if (!paidByName) {
+                    errors.push(`Skipping ${expense.description}: No payer specified`);
                     continue;
                 }
                 
                 // Find paid_by user
                 let paidByUser = null;
-                const paidByName = expense.paid_by?.trim();
                 
-                if (paidByName) {
-                    // Try to find by name in database
-                    paidByUser = await User.findOne({ 
-                        name: { $regex: new RegExp(`^${paidByName}$`, 'i') } 
-                    });
-                    
-                    // If not found, try from group members
-                    if (!paidByUser && memberMap.has(paidByName.toLowerCase())) {
-                        const userId = memberMap.get(paidByName.toLowerCase());
-                        if (userId) {
-                            paidByUser = await User.findById(userId);
-                        }
-                    }
+                // Try exact match first
+                paidByUser = await User.findOne({ 
+                    name: { $regex: new RegExp(`^${paidByName}$`, 'i') } 
+                });
+                
+                // Try from group members
+                if (!paidByUser && memberMap.has(paidByName.toLowerCase())) {
+                    const userId = memberMap.get(paidByName.toLowerCase());
+                    paidByUser = await User.findById(userId);
                 }
                 
                 if (!paidByUser) {
-                    errors.push(`User "${expense.paid_by}" not found in system or group`);
+                    errors.push(`User "${paidByName}" not found in system`);
                     continue;
                 }
                 
-                // Parse split_with
+                // Parse split_with (handle empty or undefined)
                 let splitNames = [];
-                if (expense.split_with && typeof expense.split_with === 'string') {
+                if (expense.split_with && typeof expense.split_with === 'string' && expense.split_with.trim()) {
                     splitNames = expense.split_with.split(';').map(s => s.trim()).filter(s => s);
+                }
+                
+                // If no split_with specified, default to paid_by themselves
+                if (splitNames.length === 0) {
+                    splitNames = [paidByName];
                 }
                 
                 const splitBetween = [];
                 const amount = Math.abs(parseFloat(expense.amount));
+                const splitAmount = amount / splitNames.length;
                 
-                if (splitNames.length > 0) {
-                    const splitAmount = amount / splitNames.length;
+                for (const splitName of splitNames) {
+                    let splitUser = null;
                     
-                    for (const splitName of splitNames) {
-                        let splitUser = null;
-                        
-                        // Try to find by name
-                        splitUser = await User.findOne({ 
-                            name: { $regex: new RegExp(`^${splitName}$`, 'i') } 
-                        });
-                        
-                        // If not found, try from group members
-                        if (!splitUser && memberMap.has(splitName.toLowerCase())) {
-                            const userId = memberMap.get(splitName.toLowerCase());
-                            if (userId) {
-                                splitUser = await User.findById(userId);
-                            }
-                        }
-                        
-                        if (splitUser) {
-                            splitBetween.push({
-                                user: splitUser._id,
-                                amount: splitAmount,
-                                settled: false
-                            });
-                        } else {
-                            console.log(`Warning: Split member "${splitName}" not found`);
-                        }
-                    }
-                } else {
-                    // If no split_with specified, default to paid_by themselves
-                    splitBetween.push({
-                        user: paidByUser._id,
-                        amount: amount,
-                        settled: false
+                    // Try exact match
+                    splitUser = await User.findOne({ 
+                        name: { $regex: new RegExp(`^${splitName}$`, 'i') } 
                     });
+                    
+                    // Try from group members
+                    if (!splitUser && memberMap.has(splitName.toLowerCase())) {
+                        const userId = memberMap.get(splitName.toLowerCase());
+                        splitUser = await User.findById(userId);
+                    }
+                    
+                    if (splitUser) {
+                        splitBetween.push({
+                            user: splitUser._id,
+                            amount: splitAmount,
+                            settled: false
+                        });
+                    } else {
+                        console.log(`Warning: Split member "${splitName}" not found, skipping`);
+                    }
+                }
+                
+                if (splitBetween.length === 0) {
+                    errors.push(`No valid split members for ${expense.description}`);
+                    continue;
                 }
                 
                 // Parse date (DD-MM-YYYY to YYYY-MM-DD)
@@ -745,7 +746,7 @@ router.post('/:id/import-csv/approve', protect, async (req, res) => {
                     const dateStr = expense.date.toString();
                     const parts = dateStr.split('-');
                     if (parts.length === 3) {
-                        // Assuming format DD-MM-YYYY
+                        // Format: DD-MM-YYYY
                         dateObj = new Date(parts[2], parts[1] - 1, parts[0]);
                     }
                 }
@@ -766,9 +767,10 @@ router.post('/:id/import-csv/approve', protect, async (req, res) => {
                 });
                 
                 imported++;
+                console.log(`✅ Imported: ${expense.description}`);
                 
             } catch (err) {
-                console.error(`Error importing ${expense.description}:`, err);
+                console.error(`Error importing ${expense.description}:`, err.message);
                 errors.push(`Error importing ${expense.description}: ${err.message}`);
             }
         }
